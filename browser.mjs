@@ -91,6 +91,163 @@ export async function waitForServer(url, { timeoutMs = 10_000 } = {}) {
   throw new Error(`server at ${url} did not respond within ${timeoutMs}ms`);
 }
 
+// --- Multi-turn session support ---------------------------------------
+//
+// `withPage` is single-shot: each invocation launches a fresh chromium and
+// tears it down on exit. For agent-style multi-turn workflows (turn 1
+// navigates, turn 2 inspects, turn 3 clicks) we need a long-lived chromium
+// that persists across separate node processes.
+//
+// Design: a daemon process spawns chromium directly with
+// --remote-debugging-port=<port>, writes a metadata file, and parks. Each
+// per-turn CLI invocation reads the metadata and connects over CDP via
+// `chromium.connectOverCDP`. CDP-mode contexts live on the chromium side,
+// so page URL / cookies / DOM / scroll state survive disconnects.
+//
+// (launchServer + connect would seem natural but tears down contexts on
+// disconnect, which breaks state-across-turns.)
+
+export const SESSION_DIR = path.join(
+  os.homedir(), '.cache', 'termux-playwright-harness',
+);
+
+export function sessionMetaPath(name = 'default') {
+  return path.join(SESSION_DIR, `session-${name}.json`);
+}
+
+export function sessionLogPath(name = 'default') {
+  return path.join(SESSION_DIR, `session-${name}.log`);
+}
+
+export async function readSessionMeta(name = 'default') {
+  try {
+    return JSON.parse(await fsp.readFile(sessionMetaPath(name), 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+export function isPidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code === 'EPERM'; }
+}
+
+// If the metadata file exists but the daemon PID is gone, remove the stale
+// file. Returns true if it cleared something.
+export async function clearStaleSessionMeta(name = 'default') {
+  const meta = await readSessionMeta(name);
+  if (meta && !isPidAlive(meta.pid)) {
+    await fsp.unlink(sessionMetaPath(name)).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+// Spawn chromium with a remote debugging port + a fresh user-data-dir,
+// wait for CDP to come up, write the session metadata file. Returns the
+// child handle so the caller can wire it to the daemon process lifecycle.
+//
+// The caller (the daemon) is responsible for keeping the child alive
+// (parking) and tearing it down on SIGTERM.
+export async function startSession({
+  name = 'default',
+  headless = true,
+  executablePath = DEFAULT_BIN,
+  extraArgs = [],
+} = {}) {
+  if (!existsSync(executablePath)) {
+    throw new Error(
+      `Chromium binary not found at ${executablePath}. ` +
+      `Install with \`pkg install chromium\` or set PLAYWRIGHT_CHROMIUM_BIN.`,
+    );
+  }
+  await fsp.mkdir(SESSION_DIR, { recursive: true });
+
+  const cdpPort = await findFreePort();
+  const userDataDir = await fsp.mkdtemp(
+    path.join(os.tmpdir(), `tpw-session-${name}-`),
+  );
+
+  const args = [
+    ...TERMUX_CHROMIUM_ARGS,
+    `--remote-debugging-port=${cdpPort}`,
+    `--user-data-dir=${userDataDir}`,
+    ...(headless ? ['--headless=new'] : []),
+    ...extraArgs,
+    'about:blank',
+  ];
+
+  const child = spawn(executablePath, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', (b) => process.stdout.write(`[chromium] ${b}`));
+  child.stderr.on('data', (b) => process.stderr.write(`[chromium] ${b}`));
+
+  const cdpEndpoint = `http://127.0.0.1:${cdpPort}`;
+  // /json/version is the canonical CDP discovery endpoint.
+  await waitForServer(`${cdpEndpoint}/json/version`, { timeoutMs: 20_000 });
+
+  const meta = {
+    name,
+    pid: process.pid,           // daemon node pid (what `stop` SIGTERMs)
+    chromiumPid: child.pid,
+    cdpEndpoint,
+    userDataDir,
+    headless,
+    startedAt: new Date().toISOString(),
+  };
+  await fsp.writeFile(sessionMetaPath(name), JSON.stringify(meta, null, 2));
+
+  return { child, meta, userDataDir };
+}
+
+// Read the session metadata and open a CDP connection to the running
+// chromium. Returns a Playwright Browser handle and the metadata.
+export async function connectSession({ name = 'default' } = {}) {
+  const meta = await readSessionMeta(name);
+  if (!meta) {
+    throw new Error(
+      `no active session for '${name}' — run \`node session.mjs start\` first`,
+    );
+  }
+  if (!isPidAlive(meta.pid)) {
+    throw new Error(
+      `session '${name}' is dead (daemon pid ${meta.pid} gone) — run ` +
+      `\`node session.mjs start\` to restart`,
+    );
+  }
+  const browser = await chromium.connectOverCDP(meta.cdpEndpoint);
+  return { browser, meta };
+}
+
+// Per-turn primitive: connect, pick the active context+page (the first
+// of each — create if absent), run `fn`, then disconnect (which on CDP
+// just detaches the client — chromium and its pages stay alive).
+export async function withActivePage(fn, { name = 'default' } = {}) {
+  const { browser, meta } = await connectSession({ name });
+  try {
+    let context = browser.contexts()[0];
+    if (!context) context = await browser.newContext();
+    // Surface page console errors/warnings for the duration of this turn.
+    // These listeners only fire while we're connected.
+    context.on('console', (msg) => {
+      if (['error', 'warning'].includes(msg.type())) {
+        console.error(`[page ${msg.type()}] ${msg.text()}`);
+      }
+    });
+    context.on('weberror', (e) => console.error(`[page error] ${e.error()}`));
+    let page = context.pages()[0];
+    if (!page) page = await context.newPage();
+    return await fn(page, { browser, context, meta });
+  } finally {
+    // On a CDP-connected browser this disconnects the client without
+    // closing chromium — exactly what we want for multi-turn.
+    await browser.close();
+  }
+}
+
 // Ask the kernel for an unused TCP port on the loopback. Concurrent
 // debug sessions each get their own — no shared fixed port to collide on.
 // There's a tiny TOCTOU between releasing here and the caller binding,

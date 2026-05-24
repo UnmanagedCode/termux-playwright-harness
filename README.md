@@ -7,7 +7,9 @@ Generic infrastructure only. Feature-specific scripts go in the consuming projec
 ```
 termux-playwright-harness/
 ├── browser.mjs       launchBrowser / withPage / waitForServer / findFreePort / bootServer
-├── snap.mjs          generic screenshot CLI
+│                     + startSession / connectSession / withActivePage (multi-turn)
+├── snap.mjs          generic screenshot CLI (single-shot)
+├── session.mjs       multi-turn session CLI (start / stop / status / goto / snap / eval)
 └── package.json      playwright-core only
 ```
 
@@ -165,6 +167,61 @@ node snap.mjs <url> [outputPath]
   | `PLAYWRIGHT_CHROMIUM_BIN` | Override chromium binary path | `…/chrome` |
 
 For "boot + snap + tear down" in a single command, write a small consumer CLI in your own project — `bootServer` + `withPage` is two imports and ~15 lines.
+
+## Multi-turn sessions
+
+`withPage` and `snap.mjs` are single-shot — every call launches chromium and tears it down on exit. For agent-style multi-turn workflows (turn 1 navigates, turn 2 inspects, turn 3 acts) page state would be lost between turns. The `session.mjs` CLI fixes that by keeping a long-lived chromium running in a daemon process; each per-turn CLI invocation attaches via CDP, acts on the first context's first page, and detaches without killing the browser. URL, cookies, DOM, scroll position, focused element, and form input all persist between turns.
+
+### CLI
+
+```
+node session.mjs start    [--session NAME] [--headless 0|1] [--force]
+node session.mjs status   [--session NAME]
+node session.mjs goto     <url> [--session NAME] [--wait load|domcontentloaded|networkidle|commit]
+node session.mjs snap     [outPath] [--session NAME] [--full-page]
+node session.mjs eval     <node-snippet> [--session NAME]
+node session.mjs stop     [--session NAME]
+```
+
+Default session name is `default`; override with `--session <name>` or `PW_SESSION=<name>`. Multiple named sessions run side-by-side with their own chromium / port / user-data-dir.
+
+Behaviour worth knowing:
+
+- `start` **refuses** if a session of that name is already running (exit 1). Pass `--force` to stop-then-start (drops all page state). Stale metadata (PID gone) is cleaned up silently.
+- Per-turn commands (`goto`/`snap`/`eval`) **never auto-start** a daemon — they fail with a clear error if none exists.
+- `eval` runs a JS snippet in the **daemon's Node process** with `page`, `context`, and `browser` Playwright handles in scope. Use it to batch multiple Playwright actions in one turn. Use `page.evaluate("…")` *from inside* the snippet when you need browser-side JS — that's why there's no separate in-page-eval command. The return value is JSON-printed to stdout.
+
+### Example: navigate → inspect → act
+
+```bash
+node session.mjs start
+node session.mjs goto https://example.com
+node session.mjs eval 'return page.evaluate("document.title")'    # "Example Domain"
+node session.mjs snap /tmp/t1.png
+node session.mjs eval 'await page.click("text=Learn more"); await page.waitForLoadState("load"); return page.url()'
+node session.mjs eval 'return page.url()'                          # iana.org — state persists across processes
+node session.mjs snap /tmp/t2.png
+node session.mjs stop
+```
+
+### Where things live
+
+- Session metadata: `~/.cache/termux-playwright-harness/session-<name>.json` (cdpEndpoint, daemon pid, chromium pid, user-data-dir, startedAt). Created by `start`, removed on graceful `stop`.
+- Daemon log: `~/.cache/termux-playwright-harness/session-<name>.log` — chromium stdout/stderr + daemon-side messages. Check here if `start` reports the daemon failed to come up.
+- Chromium user-data-dir: a fresh `mkdtemp` per `start`, wiped on `stop`.
+
+### Programmatic API
+
+```js
+import { withActivePage } from '../../termux-playwright-harness/browser.mjs';
+
+await withActivePage(async (page, { context, browser }) => {
+  await page.goto('https://example.com');
+  return page.title();
+}, { name: 'default' });
+```
+
+Lower-level helpers: `startSession`, `connectSession`, `readSessionMeta`, `isPidAlive`, `clearStaleSessionMeta`.
 
 ## Writing your own debug script
 
