@@ -3,7 +3,7 @@
 // ship for Android ARM). Use this from ad-hoc debug scripts so they don't
 // all have to repeat the executablePath / flags dance.
 //
-//   import { withPage } from 'termux-playwright/browser.mjs';   // or relative path
+//   import { withPage } from 'termux-playwright-harness/browser.mjs';   // or relative path
 //   await withPage(async (page) => {
 //     await page.goto('http://127.0.0.1:8787');
 //     await page.screenshot({ path: 'screenshots/home.png' });

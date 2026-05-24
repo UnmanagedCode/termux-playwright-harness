@@ -1,11 +1,11 @@
-# termux-playwright
+# termux-playwright-harness
 
 A small Playwright setup for driving a webapp through the **system Chromium** installed via Termux. Useful for visually verifying changes — screenshots, DOM assertions, console inspection — from an Android phone or any other host without a desktop browser.
 
 Generic infrastructure only. Feature-specific scripts go in the consuming project (or stay as throwaway one-liners in the shell). The goal is reusable pieces for any current or future webapp running on Termux.
 
 ```
-termux-playwright/
+termux-playwright-harness/
 ├── browser.mjs       launchBrowser / withPage / waitForServer / findFreePort / bootServer
 ├── snap.mjs          generic screenshot CLI
 └── package.json      playwright-core only
@@ -44,7 +44,7 @@ When in doubt, ask: *"Would a teammate debugging a totally different feature nex
 ## Install
 
 ```bash
-cd ~/project/termux-playwright
+cd ~/project/termux-playwright-harness
 npm install
 ```
 
@@ -52,23 +52,27 @@ npm install
 
 This package is consumed via direct relative import — no submodule, no npm publish. Clone it as a sibling of your project:
 
+```bash
+git clone git@github.com:UnmanagedCode/termux-playwright-harness.git ~/project/termux-playwright-harness
+```
+
 ```
 ~/project/
-├── termux-playwright/        # this repo
-├── my-webapp/                # your project
+├── termux-playwright-harness/    # this repo
+├── my-webapp/                    # your project
 │   └── debug/
-│       ├── boot-myapp.mjs    # optional thin wrapper for app-specific defaults
-│       └── snap.mjs          # optional app-specific CLI
+│       ├── boot-myapp.mjs        # optional thin wrapper for app-specific defaults
+│       └── snap.mjs              # optional app-specific CLI
 └── ...
 ```
 
 Then import directly:
 
 ```js
-import { withPage, bootServer } from '../../termux-playwright/browser.mjs';
+import { withPage, bootServer } from '../../termux-playwright-harness/browser.mjs';
 ```
 
-Because `playwright-core` is installed under `~/project/termux-playwright/node_modules/`, Node's module resolution finds it relative to `browser.mjs` regardless of where the importer lives.
+Because `playwright-core` is installed under `~/project/termux-playwright-harness/node_modules/`, Node's module resolution finds it relative to `browser.mjs` regardless of where the importer lives.
 
 ## Quick smoke test
 
@@ -87,7 +91,7 @@ Open `home.png` to confirm the page rendered. If you see a blank or chrome-error
 Wraps `playwright-core`'s `chromium.launch()` with the executable path and Termux-specific flags (`--no-sandbox`, `--disable-dev-shm-usage`, etc.).
 
 ```js
-import { withPage, waitForServer } from '../../termux-playwright/browser.mjs';
+import { withPage, waitForServer } from '../../termux-playwright-harness/browser.mjs';
 
 await waitForServer('http://127.0.0.1:8787');
 await withPage(async (page) => {
@@ -103,7 +107,7 @@ await withPage(async (page) => {
 - `bootServer({ cwd, entry, port?, env?, sandbox?, silent? })` — spawns an arbitrary node server as a child process on a free ephemeral port (override with `port`), waits for it to bind, and returns `{ url, port, child, sandbox?, close() }`. Cleanup is wired to parent `exit` / `SIGINT` / `SIGTERM` so a Ctrl+C'd script never leaks a server.
 
 ```js
-import { bootServer, withPage } from '../../termux-playwright/browser.mjs';
+import { bootServer, withPage } from '../../termux-playwright-harness/browser.mjs';
 
 const srv = await bootServer({
   cwd: '/path/to/my-app',
@@ -166,7 +170,7 @@ For "boot + snap + tear down" in a single command, write a small consumer CLI in
 
 ```js
 // /tmp/check-foo.mjs
-import { withPage, waitForServer } from '../../termux-playwright/browser.mjs';
+import { withPage, waitForServer } from '../../termux-playwright-harness/browser.mjs';
 
 await waitForServer('http://127.0.0.1:8787');
 await withPage(async (page) => {
